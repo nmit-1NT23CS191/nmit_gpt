@@ -1,0 +1,16 @@
+{
+  "name": "campus-rag-frontend",
+  "private": true,
+  "workspaces": [
+    "users",
+    "admin"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev -w users\" \"npm run dev -w admin\"",
+    "build": "npm run build -w users && npm run build -w admin",
+    "start": "concurrently \"npm run start -w users\" \"npm run start -w admin\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.4"
+  }
+}

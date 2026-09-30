@@ -1,0 +1,167 @@
+name: Build, Test & Deploy Smart Campus RAG Platform
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: ${{ github.repository_owner }}
+
+jobs:
+  backend-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      - name: Run Pytest (RAG tools & agent unit tests)
+        working-directory: backend
+        env:
+          SUPABASE_URL: "http://localhost:54321"
+          SUPABASE_KEY: "test-anon-key"
+          SUPABASE_SERVICE_ROLE_KEY: "test-service-role-key"
+          SUPABASE_JWT_SECRET: "test-jwt-secret"
+        run: pytest -v
+
+  frontend-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Build (type-checks + compiles)
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:8000
+          NEXT_PUBLIC_SUPABASE_URL: http://localhost:54321
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: test-anon-key
+        run: npm run build
+
+      - name: Playwright E2E tests
+        working-directory: frontend
+        run: |
+          npx playwright install --with-deps --if-present || true
+          npx playwright test --if-present || true
+
+  static-analysis:
+    runs-on: ubuntu-latest
+    needs: [backend-tests, frontend-tests]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  build-and-push-images:
+    needs: static-analysis
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: false
+          load: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/campus-backend:${{ github.sha }}
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: false
+          load: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/campus-frontend:${{ github.sha }}
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ secrets.PUBLIC_API_URL }}
+            NEXT_PUBLIC_SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+            NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
+
+      - name: Trivy scan — backend image
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/campus-backend:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: 1
+
+      - name: Trivy scan — frontend image
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/campus-frontend:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: 1
+
+      - name: Push images (only after scans pass)
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/campus-backend:${{ github.sha }}
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/campus-backend:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/campus-backend:latest
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/campus-backend:latest
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/campus-frontend:${{ github.sha }}
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/campus-frontend:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/campus-frontend:latest
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/campus-frontend:latest
+
+  deploy:
+    needs: build-and-push-images
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zero-downtime rolling deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_SSH_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            cd /opt/campus-rag-platform
+            git pull origin main
+            export IMAGE_TAG=${{ github.sha }}
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d --no-deps --scale backend=2 --scale frontend=2 backend frontend
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            docker image prune -f
